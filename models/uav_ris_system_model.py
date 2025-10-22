@@ -2076,7 +2076,7 @@ class UAVRISSecureSystem:
         aod_br = np.arctan2(delta_br[1], delta_br[0])
         aoa_br = aod_br + np.pi  # Reverse direction
 
-        self.H_br = self.channel_model.generate_rician_channel(
+        H_br_base = self.channel_model.generate_rician_channel(
             self.params.bs_antennas,
             self.params.ris_elements,
             self.params.rician_k_bs_ris_linear if is_los_br else 0,
@@ -2084,11 +2084,12 @@ class UAVRISSecureSystem:
             path_loss_br
         )
 
-        # Add CSI error
-        csi_error_br = np.sqrt(self.params.csi_error_variance_bs_ris) * \
-                       (np.random.randn(*self.H_br.shape) +
-                        1j * np.random.randn(*self.H_br.shape)) / np.sqrt(2)
-        self.H_br = self.H_br + csi_error_br
+        # Add CSI error (relative perturbation)
+        csi_error_br = np.sqrt(self.params.csi_error_variance_bs_ris) * (
+            np.random.randn(*H_br_base.shape) +
+            1j * np.random.randn(*H_br_base.shape)
+        ) / np.sqrt(2)
+        self.H_br = H_br_base * (1 + csi_error_br)
 
         # RIS-Users channels
         self.h_ru = []
@@ -2111,12 +2112,15 @@ class UAVRISSecureSystem:
             )
 
             k_factor_ru = self.params.rician_k_ris_user_linear if is_los_ru else 0
-            h_ru = np.sqrt(path_loss_ru) * (
-                    np.sqrt(k_factor_ru / (k_factor_ru + 1)) * a_ris +
-                    np.sqrt(1 / (k_factor_ru + 1)) *
-                    (np.random.randn(self.params.ris_elements) +
-                     1j * np.random.randn(self.params.ris_elements)) / np.sqrt(2)
+            h_ru_base = np.sqrt(path_loss_ru) * (
+                np.sqrt(k_factor_ru / (k_factor_ru + 1)) * a_ris +
+                np.sqrt(1 / (k_factor_ru + 1)) *
+                (np.random.randn(self.params.ris_elements) +
+                 1j * np.random.randn(self.params.ris_elements)) / np.sqrt(2)
             )
+
+            # Preserve the nominal cascaded channel before uncertainty is applied.
+            h_ru_nominal = h_ru_base
 
             # 🆕 使用耦合CSI误差
             if hasattr(self, 'coupled_uncertainty') and len(self.eve_estimated_positions) > 0:
@@ -2141,7 +2145,7 @@ class UAVRISSecureSystem:
                     quantization_bits=self.params.ris_phase_quantization_bits,
                     bs_position=self.bs_position,
                     eve_position=self.eve_estimated_positions[0],
-                    channel_to_user=h_ru
+                    channel_to_user=h_ru_nominal
                 )
 
                 # 使用耦合后的误差方差
@@ -2150,13 +2154,15 @@ class UAVRISSecureSystem:
                 # 降级到基准误差
                 csi_error_variance = self.params.csi_error_variance_ris_user
 
-            # 生成CSI误差
+            # 生成CSI误差（相对扰动）
             csi_error_ru = np.sqrt(csi_error_variance) * (
-                    np.random.randn(self.params.ris_elements) +
-                    1j * np.random.randn(self.params.ris_elements)
+                np.random.randn(self.params.ris_elements) +
+                1j * np.random.randn(self.params.ris_elements)
             ) / np.sqrt(2)
 
-            self.h_ru.append(h_ru + csi_error_ru)
+            h_ru = h_ru_nominal * (1 + csi_error_ru)
+
+            self.h_ru.append(h_ru)
 
         # RIS-Eves channels (with uncertainty)
         self.h_re_nominal = []
@@ -2185,12 +2191,20 @@ class UAVRISSecureSystem:
             )
 
             k_factor_re = self.params.rician_k_ris_eve_linear if is_los_re else 0
-            h_re = np.sqrt(path_loss_re) * (
+            h_re_base = np.sqrt(path_loss_re) * (
                 np.sqrt(k_factor_re / (k_factor_re + 1)) * a_ris_eve +
                 np.sqrt(1 / (k_factor_re + 1)) *
                 (np.random.randn(self.params.ris_elements) +
                  1j * np.random.randn(self.params.ris_elements)) / np.sqrt(2)
             )
+
+            # 生成CSI误差（相对扰动）
+            csi_error_re = np.sqrt(self.params.csi_error_variance_ris_eve) * (
+                np.random.randn(self.params.ris_elements) +
+                1j * np.random.randn(self.params.ris_elements)
+            ) / np.sqrt(2)
+
+            h_re = h_re_base * (1 + csi_error_re)
 
             self.h_re_nominal.append(h_re)
 
@@ -2262,8 +2276,10 @@ class UAVRISSecureSystem:
         M = self.params.bs_antennas
         K = self.params.num_users
 
-        # 获取当前的RIS相位（如果已优化）
-        if hasattr(self, '_current_ris_phase'):
+        # 获取当前的RIS反射系数（如果已优化）
+        if hasattr(self, '_current_ris_response'):
+            Theta = np.diag(self._current_ris_response)
+        elif hasattr(self, '_current_ris_phase'):
             Theta = np.diag(np.exp(1j * self._current_ris_phase))
         else:
             # 默认：全通相位
@@ -2435,62 +2451,92 @@ class UAVRISSecureSystem:
         else:
             phases = np.random.uniform(0, 2 * np.pi, self.params.ris_elements)
 
-        self._current_ris_phase = phases.copy()
         Theta = self.ris_controller.apply_hardware_constraints(phases)
         theta_diag = np.diag(Theta)
+        # 记录实际应用的反射系数，便于波束赋形使用硬件受限后的结果
+        self._current_ris_response = theta_diag.copy()
+        self._current_ris_phase = np.angle(theta_diag)
 
-        # ========== ✅ 修复：正确计算有效信道和接收功率 ==========
+        # 计算所有用户/窃听者的级联信道
+        cascaded_user_channels = [self.h_ru[k] @ Theta @ self.H_br
+                                  for k in range(self.params.num_users)]
+        cascaded_eve_channels = [h_re @ Theta @ self.H_br for h_re in self.h_re_worst]
 
-        # 1. 计算有效信道（包含路径损耗）
-        h_eff_user = (self.h_ru[0].conj() * theta_diag) @ self.H_br  # [M]
-        h_eff_eve = (worst_eve_channel.conj() * theta_diag) @ self.H_br  # [M]
+        if cascaded_eve_channels:
+            worst_eve_idx = int(np.argmax([np.linalg.norm(h) ** 2 for h in cascaded_eve_channels]))
+            cascaded_eve_worst = cascaded_eve_channels[worst_eve_idx]
+        else:
+            worst_eve_idx = -1
+            cascaded_eve_worst = np.zeros(self.params.bs_antennas, dtype=complex)
 
-        # 2. 归一化波束赋形向量（单位功率）
-        w_normalized = np.ones(self.params.bs_antennas, dtype=complex) / np.sqrt(self.params.bs_antennas)
+        # 使用当前级联信道重新优化波束赋形
+        W_opt = self.optimize_beamforming(self.params.bs_max_power)
+        transmit_power_actual = float(np.linalg.norm(W_opt, 'fro') ** 2)
 
-        # 3. 计算归一化信道增益
-        channel_gain_user = np.abs(h_eff_user.conj() @ w_normalized) ** 2  # 无单位
-        channel_gain_eve = np.abs(h_eff_eve.conj() @ w_normalized) ** 2  # 无单位
+        noise_power = self.params.noise_power
 
-        # 4. 计算实际接收功率（物理单位：Watts）
-        P_tx = self.params.transmit_power  # 发射功率 (W)
-        power_user = P_tx * channel_gain_user  # 接收功率 (W)
-        power_eve = P_tx * channel_gain_eve  # 接收功率 (W)
+        # 计算主用户的信号与干扰功率
+        h_eff_user = cascaded_user_channels[0]
+        signal_user = np.abs(h_eff_user @ W_opt[:, 0]) ** 2
+        interference_user = sum(np.abs(h_eff_user @ W_opt[:, j]) ** 2
+                                 for j in range(1, self.params.num_users))
 
-        # ========== ✅ 物理合理性检查 ==========
-        if power_user > P_tx * 100:  # 接收功率不应超过发射功率100倍
-            logger.error(f"UNREALISTIC power_user={power_user:.2f}W (Ptx={P_tx:.2f}W)")
-            logger.error(f"  channel_gain_user={channel_gain_user:.6f}")
-            logger.error(f"  |h_eff_user|²={np.linalg.norm(h_eff_user) ** 2:.6f}")
-            # 降级处理：限制接收功率
-            power_user = min(power_user, P_tx * 64)  # RIS最大增益≈N
-            power_eve = min(power_eve, P_tx * 64)
+        # 计算最坏窃听者的功率
+        if cascaded_eve_channels:
+            signal_eve = np.abs(cascaded_eve_worst @ W_opt[:, 0]) ** 2
+            interference_eve = sum(np.abs(cascaded_eve_worst @ W_opt[:, j]) ** 2
+                                   for j in range(1, self.params.num_users))
+        else:
+            signal_eve = 0.0
+            interference_eve = 0.0
 
-        # 5. 转换为标量（确保兼容性）
-        power_user = float(power_user)
-        power_eve = float(power_eve)
+        snr_user = signal_user / (noise_power + interference_user)
+        snr_eve = signal_eve / (noise_power + interference_eve) if cascaded_eve_channels else 0.0
 
-        # 6. 计算速率（Shannon公式）
-        noise_power = self.params.noise_power  # W
-        snr_user = power_user / noise_power
-        snr_eve = power_eve / noise_power
-
-        # ========== ✅ SNR合理性检查 ==========
-        if snr_user > 1e6:  # SNR不应超过60dB (10^6)
+        # 保持SNR的物理合理性
+        if snr_user > 1e6:
             logger.warning(f"Very high SNR_user={10 * np.log10(snr_user):.1f}dB, capping to 60dB")
-            snr_user = min(snr_user, 1e6)
-            snr_eve = min(snr_eve, 1e6)
+            snr_user = 1e6
+        if snr_eve > 1e6:
+            logger.warning(f"Very high SNR_eve={10 * np.log10(snr_eve):.1f}dB, capping to 60dB")
+            snr_eve = 1e6
 
-        rate_user = np.log2(1 + snr_user)  # bps/Hz
-        rate_eve = np.log2(1 + snr_eve)  # bps/Hz
-        secrecy_rate = max(rate_user - rate_eve, 0.0)  # bps/Hz
+        rate_user = np.log2(1 + snr_user)
+        rate_eve = np.log2(1 + snr_eve)
+        secrecy_rate = max(rate_user - rate_eve, 0.0)
+
+        # 接收功率（用于调试）
+        power_user = float(signal_user)
+        power_eve = float(signal_eve)
+        channel_gain_user = power_user / max(transmit_power_actual, 1e-12)
+        channel_gain_eve = power_eve / max(transmit_power_actual, 1e-12)
+
+        # 基于实际发射功率的合理性检查
+        if transmit_power_actual > 0 and power_user > transmit_power_actual * 64:
+            logger.error(
+                "UNREALISTIC power_user=%.2fW (Ptx=%.2fW)",
+                power_user,
+                transmit_power_actual,
+            )
+            logger.error("  |h_eff_user|²=%.6f", np.linalg.norm(h_eff_user) ** 2)
+            scale = (transmit_power_actual * 64) / max(power_user, 1e-12)
+            power_user *= scale
+            power_eve *= scale
+            snr_user = min(snr_user * scale, 1e6)
+            snr_eve = min(snr_eve * scale, 1e6)
+            rate_user = np.log2(1 + snr_user)
+            rate_eve = np.log2(1 + snr_eve)
+            secrecy_rate = max(rate_user - rate_eve, 0.0)
 
         # ========== ✅ 调试输出（每100个时隙） ==========
         if self.time_slot % 100 == 0:
             logger.info(f"Time slot {self.time_slot}:")
             logger.info(f"  Channel gain user: {channel_gain_user:.6e}")
-            logger.info(f"  Power user: {power_user:.6e} W ({10 * np.log10(power_user / 1e-3):.1f} dBm)")
-            logger.info(f"  SNR user: {10 * np.log10(snr_user):.1f} dB")
+            logger.info(f"  Power user: {power_user:.6e} W ({10 * np.log10(max(power_user, 1e-12) / 1e-3):.1f} dBm)")
+            logger.info(f"  SNR user: {10 * np.log10(max(snr_user, 1e-12)):.1f} dB")
+            if cascaded_eve_channels:
+                logger.info(f"  Power eve: {power_eve:.6e} W")
+                logger.info(f"  SNR eve: {10 * np.log10(max(snr_eve, 1e-12)):.1f} dB")
             logger.info(f"  Rate user: {rate_user:.4f} bps/Hz")
             logger.info(f"  Rate eve: {rate_eve:.4f} bps/Hz")
             logger.info(f"  Secrecy rate: {secrecy_rate:.4f} bps/Hz")
@@ -2505,7 +2551,7 @@ class UAVRISSecureSystem:
         see_metrics = self.evaluator.compute_secrecy_energy_efficiency(
             secrecy_rate=secrecy_rate,  # bps/Hz
             uav_power=uav_power_actual,
-            transmit_power=self.params.transmit_power,
+            transmit_power=transmit_power_actual,
             ris_power=self.params.ris_power
         )
 
@@ -2529,53 +2575,21 @@ class UAVRISSecureSystem:
             'snr_user': snr_user,  # 新增：用于调试
             'snr_eve': snr_eve,  # 新增：用于调试
             'uav_power': uav_power_actual,
-            'transmit_power': self.params.transmit_power,
+            'transmit_power': transmit_power_actual,
             'ris_power': self.params.ris_power,
             'phases': phases.copy(),
             'theta_matrix': Theta,
+            'beamforming_matrix': W_opt,
             'channel_gain_user': channel_gain_user,  # 新增
             'channel_gain_eve': channel_gain_eve,  # 新增
             'worst_eve_idx': worst_eve_idx,
             'performance': self.compute_system_performance(
-                self.optimize_beamforming(self.params.bs_max_power),
+                W_opt,
                 Theta
             )
         }
 
         self.performance_history.append(results['performance'])
-        return results
-
-        # P_total = (self.params.transmit_power +  # BS发射功率
-        #            self.params.ris_power +  # RIS控制功耗
-        #            uav_power_actual)  # UAV实际功耗
-        #
-        # # Compute SEE
-        # see = secrecy_rate / P_total if P_total > 0 else 0
-        #
-        # # Store results
-        # results = {
-        #     'time_slot': self.time_slot,
-        #     'uav_state': uav_state,  # 包含position, velocity, power等
-        #     'rate_user': rate_user,
-        #     'rate_eve': rate_eve,
-        #     'secrecy_rate': secrecy_rate,
-        #     'see': see,
-        #     'power_total': P_total,
-        #     'uav_power': uav_power_actual,
-        #     'phases': phases.copy(),
-        #     'theta_matrix': Theta,  # 硬件约束后的反射矩阵
-        #     'channel_gain_user': power_user.sum(),
-        #     'channel_gain_eve': power_eve.sum(),
-        #     'worst_eve_idx': worst_eve_idx,
-        #     'performance': self.compute_system_performance(
-        #         self.optimize_beamforming(self.params.bs_max_power),
-        #         Theta
-        #     )
-        # }
-        #
-        # # 更新性能历史
-        # self.performance_history.append(results['performance'])
-
         return results
 
 class ImprovedSystemScenario:

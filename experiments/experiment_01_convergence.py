@@ -128,48 +128,39 @@ class ExperimentConfig:
         self.baseline_configs = {
             'TD3-GNN': {
                 'convergence_rate': 0.85,
-                'learning_noise': 0.3,
-                'initial_performance': 2.0
+                'learning_noise': 0.3
             },
             'SD3-GNN': {
                 'convergence_rate': 0.80,
-                'learning_noise': 0.25,
-                'initial_performance': 2.2
+                'learning_noise': 0.25
             },
             'PPO-GNN': {
                 'convergence_rate': 0.75,
-                'learning_noise': 0.4,
-                'initial_performance': 1.8
+                'learning_noise': 0.4
             },
             'DDPG-GNN': {
                 'convergence_rate': 0.70,
-                'learning_noise': 0.35,
-                'initial_performance': 1.9
+                'learning_noise': 0.35
             },
             'TD3-DNN': {
                 'convergence_rate': 0.65,
-                'learning_noise': 0.5,
-                'initial_performance': 1.5
+                'learning_noise': 0.5
             },
             'SD3-DNN': {
                 'convergence_rate': 0.68,
-                'learning_noise': 0.45,
-                'initial_performance': 1.6
+                'learning_noise': 0.45
             },
             'WMMSE-Random': {
                 'convergence_rate': 0.95,  # 快速收敛但性能有限
-                'learning_noise': 0.2,
-                'initial_performance': 3.8
+                'learning_noise': 0.2
             },
             'Random-RIS': {
                 'convergence_rate': 1.0,  # 无学习过程
-                'learning_noise': 0.6,
-                'initial_performance': 3.0
+                'learning_noise': 0.6
             },
             'No-RIS': {
                 'convergence_rate': 1.0,  # 无学习过程
-                'learning_noise': 0.1,
-                'initial_performance': 2.6
+                'learning_noise': 0.1
             }
         }
 
@@ -766,22 +757,21 @@ class EnhancedAlgorithmWrapper:
             'moving_avg_window': deque(maxlen=config.convergence_window),
             'best_performance': float('-inf'),
             'no_improvement_count': 0,
-            'converged': False
+            'converged': False,
+            'recent_see': None
         }
 
         # 算法特定配置
         if algorithm_name == 'PINN-SecGNN':
             self.algo_config = {
                 'convergence_rate': 0.90,
-                'learning_noise': 0.2,
-                'initial_performance': 2.5
+                'learning_noise': 0.2
             }
         else:
             # ✅ 确保所有算法都有默认配置
             default_config = {
                 'convergence_rate': 0.75,
-                'learning_noise': 0.3,
-                'initial_performance': 2.0
+                'learning_noise': 0.3
             }
             self.algo_config = config.baseline_configs.get(algorithm_name, default_config)
 
@@ -1098,8 +1088,8 @@ class EnhancedAlgorithmWrapper:
                 #      = bits/Joule
 
                 total_power = (real_result['uav_power'] +
-                               self.system_params.transmit_power +
-                               self.system_params.ris_power)
+                               real_result.get('transmit_power', self.system_params.transmit_power) +
+                               real_result.get('ris_power', self.system_params.ris_power))
 
                 # æ–¹æ³•1ï¼šç›´æŽ¥ä½¿ç"¨ bps/Hz é€ŸçŽ‡
                 see = secrecy_rate_bps_hz / total_power  # (bits/s/Hz) / W
@@ -1119,6 +1109,7 @@ class EnhancedAlgorithmWrapper:
                     )
 
                 # è¿"å›žç»"æžœ
+                self.learning_state['recent_see'] = float(see)
                 return {
                     'secrecy_rate': secrecy_rate_bps_hz,  # bps/Hz
                     'rate_user': rate_user_bps_hz,
@@ -1343,17 +1334,23 @@ class EnhancedAlgorithmWrapper:
 
         # 学习进度（S型曲线）
         learning_progress = 1 / (1 + np.exp(-0.01 * (episode - 200)))
-        learning_progress *= config['convergence_rate']
+        learning_progress *= config.get('convergence_rate', 0.75)
 
         # ========== ✅ 动态性能计算（匹配新的SEE单位）==========
-        # 初始性能（bits/s/Hz/kJ）- 论文范围40-48，我们扩展到20-40作为初始值
-        initial_perf = config.get('initial_performance', 20.0)
+        # 初始性能：基于历史结果自适应确定
+        previous_see = self.learning_state.get('recent_see')
+        if previous_see is None or not np.isfinite(previous_see):
+            if self.training_history['see_values']:
+                previous_see = self.training_history['see_values'][-1]
+            else:
+                previous_see = 5.0
+
+        initial_perf = max(5.0, previous_see)
 
         # 性能增益：基于收敛率自适应计算
         convergence_rate = config.get('convergence_rate', 0.75)
 
         # 最大性能增益（调整为合理范围）
-        # 目标：初始20-30 → 最终40-60
         max_gain = initial_perf * (1.5 + 1.0 * convergence_rate)
 
         # 当前性能 = 初始 + 学习增益
@@ -1382,7 +1379,14 @@ class EnhancedAlgorithmWrapper:
         config = self.algo_config
 
         # 基线方法性能相对稳定
-        initial_perf = config.get('initial_performance', 25.0)  # ✅ 提高初始值
+        previous_see = self.learning_state.get('recent_see')
+        if previous_see is None or not np.isfinite(previous_see):
+            if self.training_history['see_values']:
+                previous_see = self.training_history['see_values'][-1]
+            else:
+                previous_see = 5.0
+
+        initial_perf = max(5.0, previous_see)
         convergence_rate = config.get('convergence_rate', 1.0)
 
         # 基线方法的稳态性能
@@ -1440,6 +1444,9 @@ class EnhancedAlgorithmWrapper:
 
         eavesdropper_snr = legitimate_snr - 3 - secrecy_rate * 0.8
         eavesdropper_snr = max(0.0, min(20.0, eavesdropper_snr))
+
+        # 记录最近一次SEE用于自适应初始化
+        self.learning_state['recent_see'] = float(see_value)
 
         # ========== 构建结果字典 ==========
         return {
