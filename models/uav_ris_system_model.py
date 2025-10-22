@@ -2076,7 +2076,7 @@ class UAVRISSecureSystem:
         aod_br = np.arctan2(delta_br[1], delta_br[0])
         aoa_br = aod_br + np.pi  # Reverse direction
 
-        self.H_br = self.channel_model.generate_rician_channel(
+        H_br_base = self.channel_model.generate_rician_channel(
             self.params.bs_antennas,
             self.params.ris_elements,
             self.params.rician_k_bs_ris_linear if is_los_br else 0,
@@ -2084,11 +2084,12 @@ class UAVRISSecureSystem:
             path_loss_br
         )
 
-        # Add CSI error
-        csi_error_br = np.sqrt(self.params.csi_error_variance_bs_ris) * \
-                       (np.random.randn(*self.H_br.shape) +
-                        1j * np.random.randn(*self.H_br.shape)) / np.sqrt(2)
-        self.H_br = self.H_br + csi_error_br
+        # Add CSI error (relative perturbation)
+        csi_error_br = np.sqrt(self.params.csi_error_variance_bs_ris) * (
+            np.random.randn(*H_br_base.shape) +
+            1j * np.random.randn(*H_br_base.shape)
+        ) / np.sqrt(2)
+        self.H_br = H_br_base * (1 + csi_error_br)
 
         # RIS-Users channels
         self.h_ru = []
@@ -2111,7 +2112,7 @@ class UAVRISSecureSystem:
             )
 
             k_factor_ru = self.params.rician_k_ris_user_linear if is_los_ru else 0
-            h_ru = np.sqrt(path_loss_ru) * (
+            h_ru_base = np.sqrt(path_loss_ru) * (
                     np.sqrt(k_factor_ru / (k_factor_ru + 1)) * a_ris +
                     np.sqrt(1 / (k_factor_ru + 1)) *
                     (np.random.randn(self.params.ris_elements) +
@@ -2150,13 +2151,15 @@ class UAVRISSecureSystem:
                 # 降级到基准误差
                 csi_error_variance = self.params.csi_error_variance_ris_user
 
-            # 生成CSI误差
+            # 生成CSI误差（相对扰动）
             csi_error_ru = np.sqrt(csi_error_variance) * (
-                    np.random.randn(self.params.ris_elements) +
-                    1j * np.random.randn(self.params.ris_elements)
+                np.random.randn(self.params.ris_elements) +
+                1j * np.random.randn(self.params.ris_elements)
             ) / np.sqrt(2)
 
-            self.h_ru.append(h_ru + csi_error_ru)
+            h_ru = h_ru_base * (1 + csi_error_ru)
+
+            self.h_ru.append(h_ru)
 
         # RIS-Eves channels (with uncertainty)
         self.h_re_nominal = []
@@ -2185,12 +2188,20 @@ class UAVRISSecureSystem:
             )
 
             k_factor_re = self.params.rician_k_ris_eve_linear if is_los_re else 0
-            h_re = np.sqrt(path_loss_re) * (
+            h_re_base = np.sqrt(path_loss_re) * (
                 np.sqrt(k_factor_re / (k_factor_re + 1)) * a_ris_eve +
                 np.sqrt(1 / (k_factor_re + 1)) *
                 (np.random.randn(self.params.ris_elements) +
                  1j * np.random.randn(self.params.ris_elements)) / np.sqrt(2)
             )
+
+            # 生成CSI误差（相对扰动）
+            csi_error_re = np.sqrt(self.params.csi_error_variance_ris_eve) * (
+                np.random.randn(self.params.ris_elements) +
+                1j * np.random.randn(self.params.ris_elements)
+            ) / np.sqrt(2)
+
+            h_re = h_re_base * (1 + csi_error_re)
 
             self.h_re_nominal.append(h_re)
 
