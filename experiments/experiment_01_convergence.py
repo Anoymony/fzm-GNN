@@ -1088,8 +1088,8 @@ class EnhancedAlgorithmWrapper:
                 #      = bits/Joule
 
                 total_power = (real_result['uav_power'] +
-                               self.system_params.transmit_power +
-                               self.system_params.ris_power)
+                               real_result.get('transmit_power', self.system_params.transmit_power) +
+                               real_result.get('ris_power', self.system_params.ris_power))
 
                 # æ–¹æ³•1ï¼šç›´æŽ¥ä½¿ç"¨ bps/Hz é€ŸçŽ‡
                 see = secrecy_rate_bps_hz / total_power  # (bits/s/Hz) / W
