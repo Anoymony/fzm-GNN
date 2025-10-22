@@ -1032,73 +1032,29 @@ class EnhancedAlgorithmWrapper:
 
             # âœ… å…³é"®ä¿®å¤ï¼šä½¿ç"¨ UAV-RIS ç³»ç»Ÿ
             if hasattr(self, 'uav_ris_system'):
-                # 1. ä½¿ç"¨ PINN-SecGNN çš„ RIS ç›¸ä½
+                # 1. 使用 PINN-SecGNN 的 RIS 相位
                 ris_phases = results['predictions']['ris_phases'].cpu().numpy()[0]
 
-                # 2. ä½¿ç"¨ PINN-SecGNN çš„è½¨è¿¹æŽ§åˆ¶
+                # 2. 使用 PINN-SecGNN 的轨迹控制
                 trajectory_control = results['predictions']['trajectory'].cpu().numpy()[0]
 
-                # 3. è¿è¡ŒçœŸå®žç³»ç»Ÿ
+                # 3. 运行真实系统，获取物理约束下的性能指标
                 real_result = self.uav_ris_system.run_time_slot(trajectory_control)
 
-                # 4. é‡æ–°è®¡ç®—ä½¿ç"¨PINNç›¸ä½çš„æ€§èƒ½
-                theta_diag = np.exp(1j * ris_phases)
+                # 4. 直接使用真实系统返回的指标作为评估结果
+                rate_user_bps_hz = float(real_result.get('rate_user', 0.0))
+                rate_eve_bps_hz = float(real_result.get('rate_eve', 0.0))
+                secrecy_rate_bps_hz = float(real_result.get('secrecy_rate', 0.0))
+                see = float(real_result.get('see', 0.0))
 
-                # è®¡ç®—æœ‰æ•ˆä¿¡é"
-                h_eff_user = (self.uav_ris_system.h_ru[0].conj() * theta_diag) @ self.uav_ris_system.H_br
+                total_power = float(real_result.get(
+                    'power_total',
+                    real_result.get('uav_power', 0.0) +
+                    real_result.get('transmit_power', self.system_params.transmit_power) +
+                    real_result.get('ris_power', self.system_params.ris_power)
+                ))
 
-                # æ‰¾åˆ°æœ€å·®çªƒå¬è€…
-                if len(self.uav_ris_system.h_re_worst) > 0:
-                    worst_eve_idx = np.argmax([np.linalg.norm(h) ** 2
-                                               for h in self.uav_ris_system.h_re_worst])
-                    h_eff_eve = (self.uav_ris_system.h_re_worst[
-                                     worst_eve_idx].conj() * theta_diag) @ self.uav_ris_system.H_br
-                else:
-                    h_eff_eve = np.zeros_like(h_eff_user)
-
-                # âœ… ä½¿ç"¨ç³»ç»Ÿä¼˜åŒ–çš„æ³¢æŸèµ‹å½¢
-                W_optimized = self.uav_ris_system.optimize_beamforming(
-                    self.system_params.bs_max_power
-                )
-
-                # âœ… **æ ¸å¿ƒä¿®æ­£**ï¼šæ­£ç¡®è®¡ç®—é€ŸçŽ‡ï¼ˆå½'ä¸€åŒ–åˆ°å¸¦å®½ï¼‰
-                power_user = 0.0
-                power_eve = 0.0
-
-                for k in range(self.system_params.num_users):
-                    sig_u = np.abs(h_eff_user.conj() @ W_optimized[:, k]) ** 2
-                    sig_e = np.abs(h_eff_eve.conj() @ W_optimized[:, k]) ** 2
-                    power_user += sig_u
-                    power_eve += sig_e
-
-                # **æ­£ç¡®è®¡ç®—**ï¼šé€ŸçŽ‡å½'ä¸€åŒ– (bps/Hz)
-                bandwidth = self.system_params.bandwidth  # Hz
-                noise_power = self.system_params.noise_power  # Watts
-
-                # SINRå'Œé€ŸçŽ‡ (bits/s/Hz)
-                rate_user_bps_hz = np.log2(1 + power_user / noise_power)
-                rate_eve_bps_hz = np.log2(1 + power_eve / noise_power)
-
-                # ä¿å¯†é€ŸçŽ‡ (bits/s/Hz)
-                secrecy_rate_bps_hz = max(rate_user_bps_hz - rate_eve_bps_hz, 0.0)
-
-                # âœ… **SEEè®¡ç®—**ï¼šä½¿ç"¨å½'ä¸€åŒ–çš„é€ŸçŽ‡
-                # æ³¨æ„ï¼šSEE = (R_sec [bps/Hz] Ã— BW [Hz]) / P_total [W]
-                #      = R_sec [bps] / P_total [W]
-                #      = bits/Joule
-
-                total_power = (real_result['uav_power'] +
-                               real_result.get('transmit_power', self.system_params.transmit_power) +
-                               real_result.get('ris_power', self.system_params.ris_power))
-
-                # æ–¹æ³•1ï¼šç›´æŽ¥ä½¿ç"¨ bps/Hz é€ŸçŽ‡
-                see = secrecy_rate_bps_hz / total_power  # (bits/s/Hz) / W
-
-                # æ–¹æ³•2ï¼šæˆ–è€…ä¹˜ä»¥å¸¦å®½å¾—åˆ° bps åŽå†é™¤ä»¥åŠŸçŽ‡
-                # secrecy_rate_bps = secrecy_rate_bps_hz * bandwidth
-                # see = secrecy_rate_bps / total_power  # bits/Joule
-
-                # æ—¥å¿—è¾"å‡º
+                # 日志输出
                 if step % 10 == 0:
                     logger.info(
                         f"Episode {episode}, Step {step}: "
@@ -1108,26 +1064,34 @@ class EnhancedAlgorithmWrapper:
                         f"SEE={see:.6f} (bits/s/Hz)/W"
                     )
 
-                # è¿"å›žç»"æžœ
-                self.learning_state['recent_see'] = float(see)
-                return {
-                    'secrecy_rate': secrecy_rate_bps_hz,  # bps/Hz
+                # 返回真实系统的结果，同时保留模型预测的相位用于分析
+                self.learning_state['recent_see'] = see
+                result_dict = {
+                    'secrecy_rate': secrecy_rate_bps_hz,
                     'rate_user': rate_user_bps_hz,
                     'rate_eve': rate_eve_bps_hz,
                     'see': see,
                     'power_total': total_power,
-                    'uav_power': real_result['uav_power'],
-                    'transmit_power': self.system_params.transmit_power,
-                    'ris_power': self.system_params.ris_power,
-                    'performance': {
+                    'uav_power': real_result.get('uav_power', 0.0),
+                    'transmit_power': real_result.get('transmit_power', self.system_params.transmit_power),
+                    'ris_power': real_result.get('ris_power', self.system_params.ris_power),
+                    'power_user': real_result.get('power_user', 0.0),
+                    'power_eve': real_result.get('power_eve', 0.0),
+                    'snr_user': real_result.get('snr_user', 0.0),
+                    'snr_eve': real_result.get('snr_eve', 0.0),
+                    'performance': real_result.get('performance', {
                         'sum_secrecy_rate': secrecy_rate_bps_hz,
                         'sum_rate': rate_user_bps_hz,
                         'energy_efficiency': see,
                         'outage_probability': 0.0 if secrecy_rate_bps_hz > 0 else 1.0,
-                        'legitimate_snr': 10 * np.log10(power_user / noise_power) if power_user > 0 else 0,
-                        'eavesdropper_snr': 10 * np.log10(power_eve / noise_power) if power_eve > 0 else 0
-                    }
+                        'legitimate_snr': real_result.get('snr_user', 0.0),
+                        'eavesdropper_snr': real_result.get('snr_eve', 0.0)
+                    }),
+                    'real_result': real_result,
+                    'predicted_ris_phases': ris_phases.copy()
                 }
+
+                return result_dict
             else:
                 return self._create_result_dict(0.0, episode, step)
 
